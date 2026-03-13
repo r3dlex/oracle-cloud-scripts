@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "create-ampere-p1"
+version = "0.1.0"
+description = "OCI Resource Manager automation for Ampere P1 instances"
+authors = []
+packages = [{ include = "create_ampere_p1" }]
+
+[tool.poetry.scripts]
+create-ampere-p1 = "create_ampere_p1.__main__:main"
+
+[tool.poetry.dependencies]
+python = "^3.9"
+oci = "^2.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
