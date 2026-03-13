@@ -160,26 +160,42 @@ def main() -> None:
 
     log.info("Using Stack ID: %s", args.stack_id)
 
+    # Phase 1: PLAN — retry until it succeeds, then move on.
+    plan_done = False
+    attempt = 0
+    while not plan_done:
+        attempt += 1
+        try:
+            run_plan(rm_client, args.stack_id)
+            plan_done = True
+        except oci.exceptions.TransientServiceError as exc:
+            log.warning(
+                "OCI transient error during PLAN (status %s): %s",
+                exc.status,
+                exc.message,
+            )
+            log.info("Retrying PLAN in %d seconds... (attempt %d)", args.retry_delay, attempt)
+            time.sleep(args.retry_delay)
+
+    # Phase 2: APPLY — retry until it succeeds.
     attempt = 0
     while True:
         attempt += 1
         try:
-            run_plan(rm_client, args.stack_id)
-
             if run_apply(rm_client, args.stack_id):
                 break
         except oci.exceptions.TransientServiceError as exc:
             log.warning(
-                "OCI transient error (status %s): %s",
+                "OCI transient error during APPLY (status %s): %s",
                 exc.status,
                 exc.message,
             )
 
         if args.max_retries and attempt >= args.max_retries:
-            log.error("Exhausted %d retries. Giving up.", args.max_retries)
+            log.error("Exhausted %d APPLY retries. Giving up.", args.max_retries)
             sys.exit(1)
 
-        log.info("Retrying in %d seconds... (attempt %d)", args.retry_delay, attempt)
+        log.info("Retrying APPLY in %d seconds... (attempt %d)", args.retry_delay, attempt)
         time.sleep(args.retry_delay)
 
 
