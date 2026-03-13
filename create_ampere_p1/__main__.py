@@ -160,42 +160,54 @@ def main() -> None:
 
     log.info("Using Stack ID: %s", args.stack_id)
 
-    # Phase 1: PLAN — retry until it succeeds, then move on.
-    plan_done = False
+    # State machine: PLAN -> APPLY -> exit
+    # - 429 during either phase: retry the same phase
+    # - APPLY fails (non-429): go back to PLAN
     attempt = 0
-    while not plan_done:
+    while True:
         attempt += 1
+
+        # --- PLAN ---
         try:
             run_plan(rm_client, args.stack_id)
-            plan_done = True
         except oci.exceptions.TransientServiceError as exc:
             log.warning(
                 "OCI transient error during PLAN (status %s): %s",
                 exc.status,
                 exc.message,
             )
-            log.info("Retrying PLAN in %d seconds... (attempt %d)", args.retry_delay, attempt)
+            log.info("Retrying in %d seconds... (attempt %d)", args.retry_delay, attempt)
             time.sleep(args.retry_delay)
+            continue  # retry PLAN
 
-    # Phase 2: APPLY — retry until it succeeds.
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            if run_apply(rm_client, args.stack_id):
+        # --- APPLY (retry on 429 without re-running PLAN) ---
+        apply_attempt = 0
+        while True:
+            apply_attempt += 1
+            try:
+                if run_apply(rm_client, args.stack_id):
+                    return  # success — done
+                # APPLY job failed (non-429): break to outer loop to re-PLAN
+                log.info("APPLY failed, restarting from PLAN...")
                 break
-        except oci.exceptions.TransientServiceError as exc:
-            log.warning(
-                "OCI transient error during APPLY (status %s): %s",
-                exc.status,
-                exc.message,
-            )
+            except oci.exceptions.TransientServiceError as exc:
+                log.warning(
+                    "OCI transient error during APPLY (status %s): %s",
+                    exc.status,
+                    exc.message,
+                )
+                log.info(
+                    "Retrying APPLY in %d seconds... (apply attempt %d)",
+                    args.retry_delay,
+                    apply_attempt,
+                )
+                time.sleep(args.retry_delay)
 
         if args.max_retries and attempt >= args.max_retries:
-            log.error("Exhausted %d APPLY retries. Giving up.", args.max_retries)
+            log.error("Exhausted %d retries. Giving up.", args.max_retries)
             sys.exit(1)
 
-        log.info("Retrying APPLY in %d seconds... (attempt %d)", args.retry_delay, attempt)
+        log.info("Retrying in %d seconds... (attempt %d)", args.retry_delay, attempt)
         time.sleep(args.retry_delay)
 
 
