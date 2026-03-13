@@ -163,10 +163,17 @@ def main() -> None:
     attempt = 0
     while True:
         attempt += 1
-        run_plan(rm_client, args.stack_id)
+        try:
+            run_plan(rm_client, args.stack_id)
 
-        if run_apply(rm_client, args.stack_id):
-            break
+            if run_apply(rm_client, args.stack_id):
+                break
+        except oci.exceptions.TransientServiceError as exc:
+            log.warning(
+                "OCI transient error (status %s): %s",
+                exc.status,
+                exc.message,
+            )
 
         if args.max_retries and attempt >= args.max_retries:
             log.error("Exhausted %d retries. Giving up.", args.max_retries)
