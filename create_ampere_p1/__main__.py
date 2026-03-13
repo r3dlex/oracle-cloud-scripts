@@ -15,6 +15,24 @@ DEFAULT_MAX_RETRIES = 0  # 0 = unlimited
 
 TERMINAL_STATES = {"SUCCEEDED", "FAILED", "CANCELED"}
 
+# Retry strategy for OCI API calls to handle 429 TooManyRequests and transient errors.
+# Uses exponential backoff with full jitter for general errors and equal jitter for throttles.
+RETRY_STRATEGY = oci.retry.RetryStrategyBuilder(
+    max_attempts_check=True,
+    max_attempts=8,
+    total_elapsed_time_check=True,
+    total_elapsed_time_seconds=600,
+    retry_max_wait_between_calls_seconds=60,
+    retry_base_sleep_time_seconds=2,
+    service_error_check=True,
+    service_error_retry_on_any_5xx=True,
+    service_error_retry_config={
+        400: ["QuotaExceeded", "LimitExceeded"],
+        429: [],
+    },
+    backoff_type=oci.retry.BACKOFF_FULL_JITTER_EQUAL_ON_THROTTLE_VALUE,
+).get_retry_strategy()
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(message)s",
@@ -36,7 +54,7 @@ def wait_for_job(
     """Poll a Resource Manager job until it reaches a terminal state."""
     previous_status = None
     while True:
-        job = rm_client.get_job(job_id).data
+        job = rm_client.get_job(job_id, retry_strategy=RETRY_STRATEGY).data
         status = job.lifecycle_state
 
         if status != previous_status:
@@ -60,7 +78,8 @@ def run_plan(
         oci.resource_manager.models.CreateJobDetails(
             stack_id=stack_id,
             operation="PLAN",
-        )
+        ),
+        retry_strategy=RETRY_STRATEGY,
     ).data
     log.info("Created PLAN job: %s", job.id)
 
@@ -88,7 +107,8 @@ def run_apply(
             apply_job_plan_resolution=oci.resource_manager.models.ApplyJobPlanResolution(
                 is_auto_approved=True,
             ),
-        )
+        ),
+        retry_strategy=RETRY_STRATEGY,
     ).data
     log.info("Created APPLY job: %s", job.id)
 
@@ -100,7 +120,7 @@ def run_apply(
 
     log.error("APPLY job failed: %s", getattr(job, "failure_details", None))
     try:
-        logs = rm_client.get_job_logs_content(job.id).data
+        logs = rm_client.get_job_logs_content(job.id, retry_strategy=RETRY_STRATEGY).data
         error_lines = [line for line in logs.splitlines() if "Error:" in line]
         if error_lines:
             log.error("Error from logs:\n%s", "\n".join(error_lines))
