@@ -15,6 +15,16 @@ DEFAULT_MAX_RETRIES = 0  # 0 = unlimited
 
 TERMINAL_STATES = {"SUCCEEDED", "FAILED", "CANCELED"}
 
+# Known OCI error codes for clearer log messages.
+# Reference: https://docs.oracle.com/en-us/iaas/Content/dev/terraform/troubleshooting.htm
+OCI_ERROR_HINTS = {
+    401: "Authentication failed — verify user_ocid, tenancy_ocid, fingerprint, and private_key_path.",
+    404: "Resource not found or not authorized — check IAM policies and resource OCID.",
+    409: "Resource state conflict — another operation may be in progress.",
+    429: "Too many requests — tenant is being rate-limited.",
+    500: "OCI internal error — the service encountered an unexpected condition.",
+}
+
 # Retry strategy for OCI API calls to handle 429 TooManyRequests and transient errors.
 # Uses exponential backoff with full jitter for general errors and equal jitter for throttles.
 RETRY_STRATEGY = oci.retry.RetryStrategyBuilder(
@@ -89,8 +99,39 @@ def run_plan(
         log.info("PLAN job succeeded.")
         return job.id
 
-    log.error("PLAN job failed: %s", getattr(job, "failure_details", None))
+    log.error("PLAN job %s finished with state: %s", job.id, job.lifecycle_state)
+    failure = getattr(job, "failure_details", None)
+    if failure:
+        log.error("Failure details: %s", failure)
     sys.exit(1)
+
+
+def _log_service_error(exc: oci.exceptions.ServiceError, operation: str) -> None:
+    """Log a ServiceError with a human-readable hint when available."""
+    hint = OCI_ERROR_HINTS.get(exc.status, "")
+    log.error(
+        "%s API error %d (%s): %s%s",
+        operation,
+        exc.status,
+        exc.code,
+        exc.message,
+        f" — {hint}" if hint else "",
+    )
+
+
+def _log_transient_error(
+    operation: str, exc: oci.exceptions.TransientServiceError
+) -> None:
+    """Log a TransientServiceError with a human-readable hint when available."""
+    hint = OCI_ERROR_HINTS.get(exc.status, "")
+    log.warning(
+        "%s transient error %d (%s): %s%s",
+        operation,
+        exc.status,
+        exc.code,
+        exc.message,
+        f" — {hint}" if hint else "",
+    )
 
 
 def run_apply(
@@ -118,14 +159,17 @@ def run_apply(
         log.info("APPLY job succeeded.")
         return True
 
-    log.error("APPLY job failed: %s", getattr(job, "failure_details", None))
+    log.error("APPLY job %s finished with state: %s", job.id, job.lifecycle_state)
+    failure = getattr(job, "failure_details", None)
+    if failure:
+        log.error("Failure details: %s", failure)
     try:
         logs = rm_client.get_job_logs_content(job.id, retry_strategy=RETRY_STRATEGY).data
         error_lines = [line for line in logs.splitlines() if "Error:" in line]
         if error_lines:
             log.error("Error from logs:\n%s", "\n".join(error_lines))
-    except oci.exceptions.ServiceError:
-        log.warning("Could not retrieve job logs.")
+    except oci.exceptions.ServiceError as exc:
+        _log_service_error(exc, "APPLY (fetching logs)")
 
     return False
 
@@ -160,54 +204,39 @@ def main() -> None:
 
     log.info("Using Stack ID: %s", args.stack_id)
 
-    # State machine: PLAN -> APPLY -> exit
-    # - 429 during either phase: retry the same phase
-    # - APPLY fails (non-429): go back to PLAN
-    attempt = 0
-    while True:
-        attempt += 1
+    # Flow: PLAN (retry on 429) -> APPLY (retry until succeed) -> exit
+    #
+    # PLAN retries only on transient (429) errors; a real PLAN failure is fatal.
+    # Once PLAN succeeds, APPLY retries on ANY failure (429 or job failure)
+    # until it succeeds or --max-retries is exhausted.
 
-        # --- PLAN ---
+    # --- PLAN (retry on 429) ---
+    plan_attempt = 0
+    while True:
+        plan_attempt += 1
         try:
             run_plan(rm_client, args.stack_id)
+            break  # PLAN succeeded, move to APPLY
         except oci.exceptions.TransientServiceError as exc:
-            log.warning(
-                "OCI transient error during PLAN (status %s): %s",
-                exc.status,
-                exc.message,
-            )
-            log.info("Retrying in %d seconds... (attempt %d)", args.retry_delay, attempt)
+            _log_transient_error("PLAN", exc)
+            log.info("Retrying PLAN in %d seconds... (attempt %d)", args.retry_delay, plan_attempt)
             time.sleep(args.retry_delay)
-            continue  # retry PLAN
 
-        # --- APPLY (retry on 429 without re-running PLAN) ---
-        apply_attempt = 0
-        while True:
-            apply_attempt += 1
-            try:
-                if run_apply(rm_client, args.stack_id):
-                    return  # success — done
-                # APPLY job failed (non-429): break to outer loop to re-PLAN
-                log.info("APPLY failed, restarting from PLAN...")
-                break
-            except oci.exceptions.TransientServiceError as exc:
-                log.warning(
-                    "OCI transient error during APPLY (status %s): %s",
-                    exc.status,
-                    exc.message,
-                )
-                log.info(
-                    "Retrying APPLY in %d seconds... (apply attempt %d)",
-                    args.retry_delay,
-                    apply_attempt,
-                )
-                time.sleep(args.retry_delay)
+    # --- APPLY (retry until succeed) ---
+    apply_attempt = 0
+    while True:
+        apply_attempt += 1
+        try:
+            if run_apply(rm_client, args.stack_id):
+                return  # success — done
+        except oci.exceptions.TransientServiceError as exc:
+            _log_transient_error("APPLY", exc)
 
-        if args.max_retries and attempt >= args.max_retries:
-            log.error("Exhausted %d retries. Giving up.", args.max_retries)
+        if args.max_retries and apply_attempt >= args.max_retries:
+            log.error("Exhausted %d APPLY retries. Giving up.", args.max_retries)
             sys.exit(1)
 
-        log.info("Retrying in %d seconds... (attempt %d)", args.retry_delay, attempt)
+        log.info("Retrying APPLY in %d seconds... (attempt %d)", args.retry_delay, apply_attempt)
         time.sleep(args.retry_delay)
 
 
